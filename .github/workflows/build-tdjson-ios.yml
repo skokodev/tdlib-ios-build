@@ -147,13 +147,29 @@ jobs:
         working-directory: td/example/ios
         run: ./build.sh
 
+      # Upload BEFORE verifying. A 40-minute build is expensive to repeat, and
+      # a failure in the checks below is exactly when you most want the binary
+      # in hand to inspect.
+      #
+      # build.sh's final line is `rsync --recursive libtdjson.xcframework
+      # ../tdjson/`, run from example/ios/build — so the output directory is
+      # example/ios/tdjson, not example/tdjson. It holds the xcframework plus
+      # per-platform iOS/ and iOS-simulator/ trees of headers and dylibs.
+      - name: Upload libtdjson artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libtdjson-ios
+          path: td/example/ios/tdjson/**
+          if-no-files-found: error
+          retention-days: 30
+
       # The Dart FFI layer resolves these four symbols by name at run time
       # by name, and td_create_client_id specifically is
       # the one the client probes to decide real-vs-demo mode. A build that
       # produced a library without them would fail silently on device as
       # "demo mode" with no error, so assert it here where it is cheap to see.
       - name: Verify the xcframework and its symbols
-        working-directory: td/example
+        working-directory: td/example/ios
         run: |
           set -e
           test -d tdjson/libtdjson.xcframework || {
@@ -162,30 +178,24 @@ jobs:
             exit 1
           }
 
-          echo "--- xcframework layout ---"
-          ls -la tdjson/libtdjson.xcframework
+          echo "--- tdjson output tree ---"
+          find tdjson -maxdepth 3 | head -40
+          echo "--- xcframework Info.plist ---"
           cat tdjson/libtdjson.xcframework/Info.plist || true
 
-          DEVICE_LIB=$(find tdjson/libtdjson.xcframework -path '*ios-arm64/*' \
-            \( -name 'libtdjson.dylib' -o -name 'libtdjson' \) | grep -v simulator | head -1)
+          DEVICE_LIB=$(find tdjson/libtdjson.xcframework -path '*ios-arm64/*' \( -name 'libtdjson.dylib' -o -name 'libtdjson' \) | grep -v simulator | head -1)
           test -n "$DEVICE_LIB" || {
             echo "::error::No iOS device (arm64) slice found in the xcframework"; exit 1; }
           echo "device slice: $DEVICE_LIB"
 
           echo "--- architectures ---"
           lipo -info "$DEVICE_LIB"
+          echo "--- load command / platform ---"
+          otool -l "$DEVICE_LIB" | grep -A4 LC_BUILD_VERSION | head -20 || true
 
           echo "--- exported td_* symbols ---"
           nm -gU "$DEVICE_LIB" | grep ' _td_' || true
           for SYM in _td_create_client_id _td_send _td_receive _td_execute; do
-            nm -gU "$DEVICE_LIB" | grep -q " $SYM\$" \
-              || { echo "::error::Symbol $SYM is missing from the device slice"; exit 1; }
+            nm -gU "$DEVICE_LIB" | grep -q " $SYM$" || { echo "::error::Symbol $SYM is missing from the device slice"; exit 1; }
           done
           echo "All four td_* symbols present."
-
-      - name: Upload libtdjson artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: libtdjson-ios
-          path: td/example/tdjson/**
-          retention-days: 30
