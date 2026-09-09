@@ -12,7 +12,7 @@ name: Build libtdjson (iOS)
 #
 # Run it from the Actions tab ("Run workflow") and download the
 # "libtdjson-ios" artifact when it finishes. The OpenSSL half is cached, so a
-# re-run after a failure in the TDLib half skips ~20 minutes of that.
+# re-run after a failure in the TDLib half skips the ~8 minutes it measured at.
 #
 # It produces the binary only. Wiring it into an Xcode project (adding the
 # xcframework to the target, embedding, and the -Wl,-U linker flags that stop
@@ -110,6 +110,38 @@ jobs:
         if: steps.openssl-cache.outputs.cache-hit != 'true'
         working-directory: td/example/ios
         run: ./build-openssl.sh
+
+      # TDLib generates several sources at build time (td_api.cpp, the mtproto
+      # and JSON scheme, mime_type_to_extension.cpp) with generator binaries
+      # that must RUN, so they have to be built for the host, not the target.
+      # CMakeLists.txt only defines the `prepare_cross_compiling` target under
+      # `if (NOT CMAKE_CROSSCOMPILING)`, and upstream's build.sh never invokes
+      # it — it gets those files as a side effect of "macOS" being first in
+      # its platform list, that pass being a native build. Narrowing platforms
+      # to iOS removes the only native pass, and the cross build then dies at
+      # ~8% with "No rule to make target .../generate/auto/mime_type_to_
+      # extension.cpp". So run the host generation explicitly.
+      #
+      # TD_GENERATE_SOURCE_FILES=ON makes CMakeLists return early before it
+      # requires OpenSSL (line ~169), so this configures and builds only the
+      # generators — a couple of minutes, not a second full TDLib build, which
+      # is the point of doing it this way rather than re-adding macOS.
+      - name: Generate cross-compilation sources on the host
+        working-directory: td
+        run: |
+          set -e
+          mkdir -p build-host
+          cd build-host
+          cmake -DCMAKE_BUILD_TYPE=Release -DTD_GENERATE_SOURCE_FILES=ON ..
+          cmake --build . --target prepare_cross_compiling -j"$(sysctl -n hw.ncpu)"
+          cd ..
+          echo "--- generated sources ---"
+          ls -la tdutils/generate/auto/ td/telegram/ 2>/dev/null | head -40
+          test -f tdutils/generate/auto/mime_type_to_extension.cpp || {
+            echo "::error::Host generation did not produce mime_type_to_extension.cpp"
+            find . -path '*generate/auto*' -name '*.cpp' | head -20
+            exit 1
+          }
 
       - name: Build tdjson for iOS
         working-directory: td/example/ios
