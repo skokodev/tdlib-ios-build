@@ -98,10 +98,17 @@ jobs:
 
       # Keyed on the script itself: the OpenSSL version is pinned inside it (a
       # beeware/Python-Apple-support commit), so the script changing is exactly
-      # when this output goes stale.
-      - name: Cache built OpenSSL
+      # when this output goes stale. Note the key is computed after the sed
+      # step above, so it reflects the iOS-only script actually used.
+      #
+      # Deliberately restore/save rather than actions/cache: that action only
+      # writes the cache in a post step, which is skipped when the job fails.
+      # A job that got past OpenSSL and then failed in TDLib would otherwise
+      # pay the OpenSSL cost again on every retry — which is exactly what the
+      # first three runs of this workflow did.
+      - name: Restore built OpenSSL
         id: openssl-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: td/example/ios/third_party/openssl
           key: tdlib-openssl-ios-${{ runner.os }}-${{ hashFiles('td/example/ios/build-openssl.sh') }}
@@ -110,6 +117,13 @@ jobs:
         if: steps.openssl-cache.outputs.cache-hit != 'true'
         working-directory: td/example/ios
         run: ./build-openssl.sh
+
+      - name: Save built OpenSSL
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: td/example/ios/third_party/openssl
+          key: tdlib-openssl-ios-${{ runner.os }}-${{ hashFiles('td/example/ios/build-openssl.sh') }}
 
       # TDLib generates several sources at build time (td_api.cpp, the mtproto
       # and JSON scheme, mime_type_to_extension.cpp) with generator binaries
@@ -292,7 +306,7 @@ jobs:
           echo "All four td_* symbols present."
 
           echo "--- TDLib.framework sanity ---"
-          FW_BIN=../tdjson-framework/device/TDLib.framework/TDLib
+          FW_BIN=tdjson-framework/device/TDLib.framework/TDLib
           test -f "$FW_BIN" || { echo "::error::device TDLib.framework binary missing"; exit 1; }
 
           # A wrong install_name is the classic silent failure: the app links
