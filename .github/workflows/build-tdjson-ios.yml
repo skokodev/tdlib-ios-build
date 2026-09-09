@@ -32,6 +32,10 @@ on:
         description: "TDLib git ref (branch, tag, or commit) to build"
         required: false
         default: "master"
+      ios_deployment_target:
+        description: "Minimum iOS version. Must be <= the app's IPHONEOS_DEPLOYMENT_TARGET (15.0)."
+        required: false
+        default: "15.0"
 
 jobs:
   build-ios:
@@ -77,8 +81,10 @@ jobs:
       # The greps below are the point of this step as much as the seds are: a
       # silently non-matching sed would produce a correct-looking 3-hour build
       # of everything, so a changed upstream line must fail here instead.
-      - name: Restrict both build scripts to iOS
+      - name: Restrict both build scripts to iOS and pin the deployment target
         working-directory: td/example/ios
+        env:
+          IOS_MIN: ${{ github.event.inputs.ios_deployment_target }}
         run: |
           set -e
           ORIGINAL='platforms="macOS iOS watchOS tvOS visionOS"'
@@ -95,6 +101,32 @@ jobs:
             echo "--- $SCRIPT ---"
             grep -n 'platforms=' "$SCRIPT"
           done
+
+          # TDLib's CMake/iOS.cmake only emits -mios-version-min when
+          # IOS_DEPLOYMENT_TARGET is set (see its line ~151), and build.sh
+          # never sets it — so clang falls back to the SDK version. Under
+          # Xcode 26.3 that produced a framework with MinimumOSVersion 26.2,
+          # which silently will not load on any device this app targets.
+          # OpenSSL is unaffected: Python-Apple-support builds it at
+          # -mios-version-min=12.0 regardless.
+          : "${IOS_MIN:=15.0}"
+          MARKER='  options="$options -DCMAKE_BUILD_TYPE=Release"'
+          grep -qF "$MARKER" build.sh || {
+            echo "::error::Could not find the cmake options line in build.sh."
+            echo "::error::Upstream changed set_cmake_options; re-check this injection."
+            grep -n 'options=' build.sh || true
+            exit 1
+          }
+          awk -v min="$IOS_MIN" -v marker="$MARKER" '
+            { print }
+            $0 == marker { print "  options=\"$options -DIOS_DEPLOYMENT_TARGET=" min "\""; found = 1 }
+            END { if (!found) exit 1 }
+          ' build.sh > build.sh.patched || {
+            echo "::error::Failed to inject IOS_DEPLOYMENT_TARGET into build.sh"; exit 1; }
+          mv build.sh.patched build.sh
+          chmod +x build.sh
+          echo "--- pinned deployment target ---"
+          grep -n 'IOS_DEPLOYMENT_TARGET' build.sh
 
       # Keyed on the script itself: the OpenSSL version is pinned inside it (a
       # beeware/Python-Apple-support commit), so the script changing is exactly
@@ -192,6 +224,8 @@ jobs:
       # CMake/iOS.cmake — not this workflow — decides it.
       - name: Wrap the dylibs into TDLib.xcframework
         working-directory: td/example/ios/build
+        env:
+          IOS_MIN: ${{ github.event.inputs.ios_deployment_target }}
         run: |
           set -e
           OUT=../tdjson-framework
@@ -230,6 +264,16 @@ jobs:
               exit 1
             fi
             echo "$TAG slice: arch=$(lipo -info "$FW/TDLib" | sed 's/.*: //'), minimum iOS $MINOS"
+
+            # The whole point of pinning IOS_DEPLOYMENT_TARGET above. A
+            # framework whose minimum is higher than the app's deployment
+            # target builds and ships happily, then fails to load at launch.
+            : "${IOS_MIN:=15.0}"
+            if [ "$MINOS" != "$IOS_MIN" ]; then
+              echo "::error::$TAG slice has MinimumOSVersion $MINOS, expected $IOS_MIN"
+              echo "::error::Check that the IOS_DEPLOYMENT_TARGET injection into build.sh took effect."
+              exit 1
+            fi
 
             cat > "$FW/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
