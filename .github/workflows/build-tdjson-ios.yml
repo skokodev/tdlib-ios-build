@@ -163,6 +163,97 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      # ── Make the output shippable ────────────────────────────────────────
+      # TDLib's build.sh emits bare .dylib files packaged into an xcframework.
+      # iOS does not support standalone dynamic libraries outside a framework
+      # bundle, and App Store Connect rejects them with ITMS-90171 ("apps
+      # cannot contain standalone executables or libraries"). So the raw
+      # xcframework above is useful for inspection but cannot ship; wrap each
+      # dylib in a real TDLib.framework and build a second xcframework of
+      # those. That is also the shape the Dart FFI loader already
+      # probes ('TDLib.framework/TDLib').
+      #
+      # MinimumOSVersion is read back out of the binary rather than guessed:
+      # it must not exceed the app's deployment target, and TDLib's
+      # CMake/iOS.cmake — not this workflow — decides it.
+      - name: Wrap the dylibs into TDLib.xcframework
+        working-directory: td/example/ios/build
+        run: |
+          set -e
+          OUT=../tdjson-framework
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+
+          for SLICE in "iOS:iPhoneOS:device" "iOS-simulator:iPhoneSimulator:simulator"; do
+            INSTALL=${SLICE%%:*}
+            REST=${SLICE#*:}
+            SDKNAME=${REST%%:*}
+            TAG=${REST#*:}
+
+            DYLIB="install-${INSTALL}/lib/libtdjson.dylib"
+            if [ ! -f "$DYLIB" ]; then
+              echo "::error::Expected $DYLIB, which build.sh should have installed"
+              ls -la install-* 2>/dev/null || true
+              exit 1
+            fi
+
+            FW="$OUT/$TAG/TDLib.framework"
+            mkdir -p "$FW/Headers"
+            cp "$DYLIB" "$FW/TDLib"
+            chmod +x "$FW/TDLib"
+            install_name_tool -id @rpath/TDLib.framework/TDLib "$FW/TDLib"
+
+            cp "install-${INSTALL}/include/td/telegram/td_json_client.h" "$FW/Headers/" 2>/dev/null \
+              || echo "note: td_json_client.h not installed; the framework ships without headers (Dart looks symbols up by name, so this is not fatal)"
+
+            MINOS=$(otool -l "$FW/TDLib" | awk '$1=="minos"{print $2; exit}')
+            if [ -z "$MINOS" ]; then
+              MINOS=$(otool -l "$FW/TDLib" | awk '/LC_VERSION_MIN_IPHONEOS/{f=1} f&&$1=="version"{print $2; exit}')
+            fi
+            if [ -z "$MINOS" ]; then
+              echo "::error::Could not read the minimum iOS version out of $DYLIB"
+              otool -l "$FW/TDLib" | head -60
+              exit 1
+            fi
+            echo "$TAG slice: arch=$(lipo -info "$FW/TDLib" | sed 's/.*: //'), minimum iOS $MINOS"
+
+            cat > "$FW/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key><string>en</string>
+            <key>CFBundleExecutable</key><string>TDLib</string>
+            <key>CFBundleIdentifier</key><string>org.telegram.TDLib</string>
+            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+            <key>CFBundleName</key><string>TDLib</string>
+            <key>CFBundlePackageType</key><string>FMWK</string>
+            <key>CFBundleShortVersionString</key><string>1.0</string>
+            <key>CFBundleVersion</key><string>1</string>
+            <key>CFBundleSupportedPlatforms</key><array><string>${SDKNAME}</string></array>
+            <key>MinimumOSVersion</key><string>${MINOS}</string>
+          </dict>
+          </plist>
+          PLIST
+            plutil -lint "$FW/Info.plist"
+          done
+
+          xcodebuild -create-xcframework \
+            -framework "$OUT/device/TDLib.framework" \
+            -framework "$OUT/simulator/TDLib.framework" \
+            -output "$OUT/TDLib.xcframework"
+
+          echo "--- TDLib.xcframework ---"
+          find "$OUT/TDLib.xcframework" -maxdepth 3
+
+      - name: Upload TDLib.xcframework (the shippable one)
+        uses: actions/upload-artifact@v4
+        with:
+          name: TDLib-xcframework-ios
+          path: td/example/ios/tdjson-framework/TDLib.xcframework/**
+          if-no-files-found: error
+          retention-days: 30
+
       # The Dart FFI layer resolves these four symbols by name at run time
       # by name, and td_create_client_id specifically is
       # the one the client probes to decide real-vs-demo mode. A build that
@@ -199,3 +290,29 @@ jobs:
             nm -gU "$DEVICE_LIB" | grep -q " $SYM$" || { echo "::error::Symbol $SYM is missing from the device slice"; exit 1; }
           done
           echo "All four td_* symbols present."
+
+          echo "--- TDLib.framework sanity ---"
+          FW_BIN=../tdjson-framework/device/TDLib.framework/TDLib
+          test -f "$FW_BIN" || { echo "::error::device TDLib.framework binary missing"; exit 1; }
+
+          # A wrong install_name is the classic silent failure: the app links
+          # and ships, then dyld cannot find the image at launch. It must be
+          # @rpath-relative and name the framework, not the original dylib.
+          INSTALL_NAME=$(otool -D "$FW_BIN" | tail -1)
+          echo "install_name: $INSTALL_NAME"
+          test "$INSTALL_NAME" = "@rpath/TDLib.framework/TDLib" || {
+            echo "::error::install_name is '$INSTALL_NAME', expected @rpath/TDLib.framework/TDLib"; exit 1; }
+
+          # The dylib must be self-contained apart from OS libraries: build.sh
+          # links tdcore and OpenSSL in statically. Anything else listed here
+          # would be a second binary we would also have to ship.
+          echo "--- framework dependencies ---"
+          otool -L "$FW_BIN"
+          otool -L "$FW_BIN" | tail -n +2 | grep -vE '/usr/lib/|/System/Library/|@rpath/TDLib.framework/TDLib' \
+            && { echo "::error::framework depends on a non-system library (see above)"; exit 1; } || true
+
+          for SYM in _td_create_client_id _td_send _td_receive _td_execute; do
+            nm -gU "$FW_BIN" | grep -q " $SYM$" \
+              || { echo "::error::Symbol $SYM missing from TDLib.framework"; exit 1; }
+          done
+          echo "TDLib.framework verified: symbols present, install_name correct, no extra dependencies."
