@@ -332,7 +332,11 @@ jobs:
           echo "--- xcframework Info.plist ---"
           cat tdjson/libtdjson.xcframework/Info.plist || true
 
-          DEVICE_LIB=$(find tdjson/libtdjson.xcframework -path '*ios-arm64/*' \( -name 'libtdjson.dylib' -o -name 'libtdjson' \) | grep -v simulator | head -1)
+          # TDLib names the library with its version — libtdjson.1.8.67.dylib
+          # — inside the xcframework, though the copy under install-*/lib that
+          # the wrapping step uses is the unversioned name. Match both, and
+          # the extensionless form a framework-style slice would use.
+          DEVICE_LIB=$(find tdjson/libtdjson.xcframework -path '*ios-arm64/*' \( -name 'libtdjson*.dylib' -o -name 'libtdjson' \) | grep -v simulator | head -1)
           test -n "$DEVICE_LIB" || {
             echo "::error::No iOS device (arm64) slice found in the xcframework"; exit 1; }
           echo "device slice: $DEVICE_LIB"
